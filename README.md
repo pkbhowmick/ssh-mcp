@@ -165,12 +165,13 @@ refuses the call.
   read; no sudo row reads stdin. `LC_ALL=C.UTF-8` keeps sudo's messages (and the `stat -c %F` file types
   below) in English, so they can be recognised on hosts with another language.
 - stdout and stderr are captured together, in order, for the result; stderr is also kept on its own
-  (first 8 KB), and the server notes whether stdout produced any byte at all. A sudo call is treated as an
-  authentication failure only when all three hold: the exit code is non-zero, stdout is completely empty
-  (when sudo rejects the password the command never runs), and stderr contains a sudo authentication
-  message (`incorrect password`, `Sorry, try again`, `Authentication failed`, `incorrect authentication`,
-  `a password is required`, `no password was provided`; matched case-insensitively). A log file that
-  merely contains those words is a normal result. On a real failure the cached password is cleared, the
+  (first 8 KB). A sudo call is treated as an authentication failure only when the exit code is non-zero
+  and stderr has a line written by sudo itself (`Sorry, try again.`, or a line starting with `sudo: ` or
+  `sudo-rs: `) that contains an authentication message (`incorrect password`, `Authentication failed`,
+  `incorrect authentication`, `a password is required`, `no password was provided`; matched
+  case-insensitively). File contents arrive on stdout and a command's own error lines start with its
+  name, so a log that mentions those words, or a file name or flag value echoed in an error, is a normal
+  result. On a real failure the cached password is cleared, the
   call returns an error that quotes at most 300 bytes of sanitized stderr marked as untrusted host
   output, and nothing is retried. With classic sudo that is one failed attempt.
   sudo-rs keeps asking after the input ends and reports three failed attempts for one wrong password, so
@@ -215,6 +216,9 @@ always goes through steps 1, 2 and 5 and must be inside `sudo_read_dirs`, so add
 Cloud Hypervisor API sockets live on your hosts (for example `/run/cloud-hypervisor`), after checking
 what else that directory holds.
 
+Because the resolved path replaces the original, `ls -l`, `stat` and `readlink` on a symlink inside
+`sudo_read_dirs` describe its target, not the link itself.
+
 Resolution, type check and read are separate commands, so a path swapped between them is not caught.
 That is acceptable for the agent-mistakes threat model and not for a hostile one.
 
@@ -228,8 +232,8 @@ That is acceptable for the agent-mistakes threat model and not for a hostile one
 | Output cap | stdout and stderr together. Without `grep`/`tail`, the first 32 KB is kept and the rest discarded, with the note "(output truncated at 32 KB)". With `grep` or `tail`, up to 4 MB is captured and filtered locally, and the filtered text is then cut to its first 32 KB with the same note; if the 4 MB capture itself overflowed, the header says "(grep/tail saw only the first 4 MB of output)" |
 | Terminal | no pty is requested; stdin is empty for non-sudo commands |
 | Output label | every result starts with a header saying the rest is untrusted output from the host, not instructions |
-| Output hygiene | in everything returned from host output (results and the host-quoted part of errors), C0 controls except newline and tab, DEL, C1 controls, and the invisible or bidi format characters U+200B–U+200F, U+202A–U+202E, U+2060–U+2069 and U+FEFF become `?`; a literal `[ssh-mcp]` becomes `[ssh-mcp*]`. This happens before local grep/tail |
-| Local grep cost | each line is matched on its first 64 KB only; patterns that compile to more than 1000 instructions are refused; the filter stops with an error after 5 s |
+| Output hygiene | in everything returned from host output (results and the host-quoted part of errors), Unicode control characters except newline and tab (C0, DEL, C1), format characters (category Cf: zero-width, bidi, tag characters and similar) and line/paragraph separators become `?`; a literal `[ssh-mcp]` becomes `[ssh-mcp*]`. Error text that quotes the peer or the host is cut to a few hundred bytes. This happens before local grep/tail |
+| Local grep cost | each line is matched on its first 64 KB only, and the header says how many lines were longer; patterns that compile to more than 1000 instructions are refused; the filter stops with an error after 5 s |
 | Concurrency | one global lock: calls are serialized, including while a dialog is open |
 | Audit log | one line per call, refused ones included, appended to `~/.local/state/ssh-mcp/audit.log` (directory 0700, file 0600) |
 

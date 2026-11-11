@@ -130,7 +130,7 @@ func call(in input) (string, error) {
 	r, err := execute(in.Host, h, v, sudo, cfg.SudoReadDirs, limit)
 	// Only the tool's own stderr counts: the same words inside log messages on
 	// stdout must not trigger a sudo prompt.
-	if err == nil && !sudo && v.sudoHint != "" && strings.Contains(r.stderr, v.sudoHint) {
+	if err == nil && !sudo && v.sudoHint != "" && hasLinePrefix(r.stderr, v.sudoHint) {
 		// The host said the unprivileged answer is incomplete; "no entries" would mislead.
 		r, err = execute(in.Host, h, v, true, cfg.SudoReadDirs, limit)
 	}
@@ -148,9 +148,28 @@ func call(in input) (string, error) {
 // respond filters the captured output locally, cuts it to maxOut and adds the
 // header. rawTrunc means the capture itself (maxOut, or rawMax with a filter)
 // overflowed.
+// hasLinePrefix reports whether a line of s starts with prefix.
+func hasLinePrefix(s, prefix string) bool {
+	for _, l := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func respond(host, out string, code int, rawTrunc bool, re *regexp.Regexp, tail int) (string, error) {
 	filtered := re != nil || tail > 0
-	text, err := filter(sanitize(out), re, tail)
+	out = sanitize(out)
+	long := 0
+	if re != nil {
+		for _, l := range strings.Split(out, "\n") {
+			if len(l) > grepLineMax {
+				long++
+			}
+		}
+	}
+	text, err := filter(out, re, tail)
 	if err != nil {
 		return "", err
 	}
@@ -164,6 +183,9 @@ func respond(host, out string, code int, rawTrunc bool, re *regexp.Regexp, tail 
 	}
 	if rawTrunc && filtered {
 		head += " (grep/tail saw only the first 4 MB of output)"
+	}
+	if long > 0 {
+		head += fmt.Sprintf(" (%d lines over 64 KB were matched by grep on their first 64 KB only)", long)
 	}
 	if cut {
 		head += " (output truncated at 32 KB)"

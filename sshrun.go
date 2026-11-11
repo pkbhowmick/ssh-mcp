@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
@@ -116,7 +117,7 @@ func execute(alias string, h hostCfg, v checked, sudo bool, dirs []string, limit
 			for k, ty := range types {
 				if ty != "regular file" && ty != "regular empty file" {
 					return result{}, fmt.Errorf("%s is not a regular file (the host says %q); only regular files are read under sudo",
-						resolved[k], sanitize(ty))
+						clip(sanitize(resolved[k]), 300), sanitize(ty))
 				}
 			}
 		}
@@ -134,7 +135,9 @@ func (c *hostConn) sudoLines(argv []string, n int) ([]string, error) {
 		return nil, fmt.Errorf("%s failed on the host (exit %d); host output, untrusted: %s",
 			argv[0], r.code, clip(sanitize(strings.TrimSpace(r.out)), 300))
 	}
-	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	// Only the final newline is removed: trimming more would rewrite a resolved
+	// path that ends in a space into a different, unchecked path.
+	lines := strings.Split(strings.TrimSuffix(r.stdout, "\n"), "\n")
 	if len(r.stdout) >= sideMax || len(lines) != n {
 		return nil, fmt.Errorf("%s printed %d lines for %d paths; refusing", argv[0], len(lines), n)
 	}
@@ -155,17 +158,31 @@ func (c *hostConn) sudo(argv []string, limit int) (result, error) {
 		return r, err
 	}
 	r.out = strings.TrimPrefix(r.out, "\n") // sudo-rs: blank line on stderr after reading the password
-	if r.code != 0 && !r.gotStdout {
-		low := strings.ToLower(r.stderr)
+	if r.code != 0 && sudoAuthFailed(r.stderr) {
+		c.sudoPass = ""
+		return result{}, fmt.Errorf("sudo authentication failed on %s; the cached sudo password was cleared and nothing was retried. Host stderr, untrusted: %s",
+			c.alias, clip(sanitize(strings.TrimSpace(r.stderr)), 300))
+	}
+	return r, nil
+}
+
+// sudoAuthFailed looks only at stderr lines written by sudo itself ("sudo: ...",
+// "sudo-rs: ...", or "Sorry, try again."). File contents are on stdout, and a
+// command's own error lines start with its name, so neither a log that mentions
+// a failure nor a file name or flag value echoed in an error can fake one.
+func sudoAuthFailed(stderr string) bool {
+	for _, l := range strings.Split(strings.ToLower(stderr), "\n") {
+		l = strings.TrimSpace(l)
+		if l != "sorry, try again." && !strings.HasPrefix(l, "sudo: ") && !strings.HasPrefix(l, "sudo-rs: ") {
+			continue
+		}
 		for _, m := range sudoFailures {
-			if strings.Contains(low, m) {
-				c.sudoPass = ""
-				return result{}, fmt.Errorf("sudo authentication failed on %s; the cached sudo password was cleared and nothing was retried. Host stderr, untrusted: %s",
-					c.alias, clip(sanitize(strings.TrimSpace(r.stderr)), 300))
+			if strings.Contains(l, m) {
+				return true
 			}
 		}
 	}
-	return r, nil
+	return false
 }
 
 // run executes one remote command string with the given stdin.
@@ -188,7 +205,7 @@ func (c *hostConn) run(cmd, stdin string, limit int) (result, error) {
 		if s, err = c.client.NewSession(); err != nil {
 			c.client.Close()
 			c.client = nil
-			return result{}, fmt.Errorf("ssh session to %s: %s", c.alias, sanitize(err.Error()))
+			return result{}, fmt.Errorf("ssh session to %s (peer text, untrusted): %s", c.alias, clip(sanitize(err.Error()), 500))
 		}
 	}
 	defer s.Close()
@@ -219,7 +236,7 @@ func (c *hostConn) run(cmd, stdin string, limit int) (result, error) {
 	if err != nil {
 		var ee *ssh.ExitError
 		if !errors.As(err, &ee) {
-			return result{}, fmt.Errorf("ssh to %s: %s", c.alias, sanitize(err.Error()))
+			return result{}, fmt.Errorf("ssh to %s (peer text, untrusted): %s", c.alias, clip(sanitize(err.Error()), 500))
 		}
 		r.code = ee.ExitStatus()
 	}
@@ -291,7 +308,7 @@ func (c *hostConn) dial() error {
 			return fmt.Errorf("login to %s cancelled or timed out", who)
 		}
 		// x/crypto errors can carry server-sent text (disconnect reasons).
-		return fmt.Errorf("ssh to %s: %s", who, sanitize(err.Error()))
+		return fmt.Errorf("ssh to %s (may quote peer text, untrusted): %s", who, clip(sanitize(err.Error()), 500))
 	}
 	c.client = cl
 	return nil
@@ -352,6 +369,16 @@ func (w *capWriter) result(secret string, max int) (string, bool) {
 	if len(s) > max {
 		s, trunc = s[:max], true
 	}
+	if trunc && len(secret) >= 4 {
+		// Redaction shrinks earlier copies, so a later copy can end up cut in
+		// half at the boundary: drop a trailing partial copy of the secret.
+		for k := min(len(secret)-1, len(s)); k >= 1; k-- {
+			if strings.HasSuffix(s, secret[:k]) {
+				s = s[:len(s)-k]
+				break
+			}
+		}
+	}
 	return s, trunc
 }
 
@@ -363,9 +390,7 @@ func sanitize(s string) string {
 		switch {
 		case r == '\n' || r == '\t':
 			return r
-		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f,
-			r >= 0x200b && r <= 0x200f, r >= 0x202a && r <= 0x202e,
-			r >= 0x2060 && r <= 0x2069, r == 0xfeff:
+		case unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp):
 			return '?'
 		}
 		return r

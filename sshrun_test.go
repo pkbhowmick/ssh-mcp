@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -503,7 +504,9 @@ func TestSSHSudoFailurePhrasesInOutput(t *testing.T) {
 	}{
 		// A root-only log that mentions failures, read by a command that exits 1.
 		{"phrases on stdout", reply{out: all, code: 1}},
-		{"phrase on stderr, stdout not empty", reply{out: "line\n", stderr: "sudo: a password is required\n", code: 1}},
+		{"phrase in a command's own stderr line", reply{out: "line\n", stderr: "cat: a password is required\n", code: 1}},
+		{"flag value echoed in an error, no stdout", reply{stderr: "head: invalid number of lines: 'sorry, try again'\n", code: 1}},
+		{"file name echoed in an error, no stdout", reply{stderr: "ls: cannot access '/var/log/incorrect password ': No such file or directory\n", code: 1}},
 		{"long log", reply{out: strings.Repeat(all, 1000), stderr: "cat: /var/log/d: Is a directory\n", code: 1}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -650,7 +653,9 @@ func TestCallJournalSudoHint(t *testing.T) {
 	// The hint inside a log message on stdout: one exec, no sudo.
 	f, d := setup(t)
 	callSetup(t, f)
-	f.setHandler(func(string, string) reply { return reply{out: "Nov 11 host user: " + hint + "\n"} })
+	f.setHandler(func(string, string) reply {
+		return reply{out: hint + "\n", stderr: "Failed to parse timestamp: " + hint + "\n"}
+	})
 	if _, err := call(input{Host: "hv1", Command: "journalctl", Args: []string{"-n", "5"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +673,7 @@ func TestCallJournalSudoHint(t *testing.T) {
 		if strings.Contains(cmd, "sudo") {
 			return reply{out: "all entries\n"}
 		}
-		return reply{out: "own entries\n", stderr: "Hint: You are currently " + hint + ".\n"}
+		return reply{out: "own entries\n", stderr: hint + " and the system.\n"}
 	})
 	got, err := call(input{Host: "hv1", Command: "journalctl", Args: []string{"-n", "5"}})
 	if err != nil || !strings.HasSuffix(got, "\nall entries\n") {
@@ -705,5 +710,82 @@ func TestCallSanitizesAndGrepDeadline(t *testing.T) {
 	audit, _ := os.ReadFile(filepath.Join(os.Getenv("HOME"), ".local", "state", "ssh-mcp", "audit.log"))
 	if !strings.Contains(string(audit), "failed: grep took too long") {
 		t.Errorf("audit:\n%s", audit)
+	}
+}
+
+// A resolved path ending in a space must be used exactly as realpath printed
+// it: trimming it would turn it into a different path that was never checked.
+func TestSSHResolvedPathKeepsTrailingSpace(t *testing.T) {
+	f, _ := setup(t)
+	realpath := remoteCmd([]string{"realpath", "-e", "--", "/var/log/l"}, true)
+	f.setHandler(func(cmd, _ string) reply {
+		if cmd == realpath {
+			return reply{out: "/var/log/tgt \n"}
+		}
+		return reply{out: "listing\n"}
+	})
+	if _, err := exec1(f, []string{"ls", "/var/log/l"}, true); err != nil {
+		t.Fatal(err)
+	}
+	ex := f.recorded()
+	if len(ex) != 2 || ex[1].cmd != remoteCmd([]string{"ls", "/var/log/tgt "}, true) {
+		t.Errorf("execs %q", ex)
+	}
+	// A trailing newline in the name means two lines for one path: refused.
+	f, _ = setup(t)
+	f.setHandler(func(string, string) reply { return reply{out: "/var/log/nl\n\n"} })
+	if _, err := exec1(f, []string{"ls", "/var/log/l"}, true); err == nil {
+		t.Error("a resolved path with a trailing newline was accepted")
+	}
+}
+
+// A wrong password must be detected even when the remote shell's startup
+// files print to stdout; otherwise it would be replayed on every call.
+func TestSSHSudoAuthFailureWithNoisyStdout(t *testing.T) {
+	f, _ := setup(t)
+	f.setHandler(func(string, string) reply {
+		return reply{out: "motd from .bashrc\n", stderr: "sudo-rs: Maximum 3 incorrect authentication attempts\n", code: 1}
+	})
+	if _, err := exec1(f, []string{"nft", "list", "ruleset"}, true); err == nil || cachedSudoPass() != "" {
+		t.Errorf("err=%v, cached=%v", err, cachedSudoPass() != "")
+	}
+}
+
+func TestSanitizeFormatChars(t *testing.T) {
+	for _, bad := range []string{"\U000E0041", "؜", "­", "᠎", " ", " ", "￹", "‮", "\x1b"} {
+		if got := sanitize("a" + bad + "b"); got != "a?b" {
+			t.Errorf("%U: %q", []rune(bad)[0], got)
+		}
+	}
+	if got := sanitize("tab\tnl\nüñí 日本"); got != "tab\tnl\nüñí 日本" {
+		t.Errorf("ordinary text changed: %q", got)
+	}
+}
+
+// Redaction shortens earlier copies, so a later copy could be cut in half at
+// the limit; no prefix of the secret may survive at the end.
+func TestRedactionAtCut(t *testing.T) {
+	secret := "0123456789abcdefghij"
+	w := &capWriter{limit: 100 + len(secret)}
+	w.Write([]byte(secret + secret + strings.Repeat("x", 61) + secret + strings.Repeat("y", 50)))
+	out, trunc := w.result(secret, 100)
+	if !trunc || len(out) > 100 {
+		t.Fatalf("trunc=%v len=%d", trunc, len(out))
+	}
+	for k := 4; k < len(secret); k++ {
+		if strings.Contains(out, secret[:k]) {
+			t.Fatalf("output contains the first %d bytes of the secret: %q", k, out)
+		}
+	}
+}
+
+func TestRespondLongLineNote(t *testing.T) {
+	long := strings.Repeat("a", grepLineMax+10) + "NEEDLE\nshort NEEDLE\n"
+	got, err := respond("hv1", long, 0, false, regexp.MustCompile("NEEDLE"), 0)
+	if err != nil || !strings.Contains(got, "1 lines over 64 KB") || !strings.HasSuffix(got, "\nshort NEEDLE\n") {
+		t.Errorf("err=%v head=%q", err, got[:min(len(got), 160)])
+	}
+	if got, _ := respond("hv1", "short NEEDLE\n", 0, false, regexp.MustCompile("NEEDLE"), 0); strings.Contains(got, "over 64 KB") {
+		t.Error("note without a long line")
 	}
 }

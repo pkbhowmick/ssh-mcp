@@ -116,7 +116,7 @@ var table = map[string]row{
 		flags: flagSet("-u= -n= -b= -k -p= -o= -r -x --since= --until="),
 		pre:   []string{"--no-pager"},
 		// Without journal access, journalctl prints this and shows only the login user's own entries.
-		sudoHint: "not seeing messages from other users",
+		sudoHint: "Hint: You are currently not seeing messages from other users",
 		check:    maxPos(0),
 		rule:     "no arguments other than flags; -b needs a value (-b 0 is the current boot)",
 	},
